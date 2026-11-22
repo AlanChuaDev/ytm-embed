@@ -1,0 +1,280 @@
+name: Build embeddable YT Music
+
+# 自动取 cvnertnc/rvx-app 最新 Release 里的 YT Music 非 root APK，
+# 改 manifest 允许被嵌入，重新签名，发布到本仓库的 Releases。
+on:
+  schedule:
+    - cron: "17 3 * * *"   # 每天检查一次上游有没有新版本
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "即使这个上游版本已经构建过，也重新构建"
+        type: boolean
+        default: false
+      upstream_tag:
+        description: "指定上游 Release 标签（留空 = 最新）"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: cvnertnc/rvx-app
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 找上游最新 Release 和 YT Music APK
+        id: up
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.upstream_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release view -R "$UPSTREAM" --json tagName -q .tagName)
+          fi
+          echo "上游标签: $TAG"
+          echo "上游文件列表:"
+          gh release view "$TAG" -R "$UPSTREAM" --json assets -q '.assets[].name' | tee assets.txt
+          # 只要 Music 的 apk（不要 module zip），优先 arm64（Tab S8 是 arm64）
+          ASSET=$(grep -iE '^music.*\.apk$' assets.txt | { grep -i arm64 || true; } | head -n1 || true)
+          if [ -z "$ASSET" ]; then ASSET=$(grep -iE '^music.*\.apk$' assets.txt | head -n1 || true); fi
+          if [ -z "$ASSET" ]; then
+            echo "::error::上游这个 Release 里没找到 music*.apk，看上面的文件列表"
+            exit 1
+          fi
+          echo "选中: $ASSET"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+
+      - name: 检查是否已经构建过
+        id: seen
+        run: |
+          set -euo pipefail
+          OUT_TAG="ytm-embed-${{ steps.up.outputs.tag }}"
+          if gh release view "$OUT_TAG" >/dev/null 2>&1 && [ "${{ inputs.force }}" != "true" ]; then
+            echo "$OUT_TAG 已存在，跳过（想重建就手动运行并勾选 force）"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "out_tag=$OUT_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: 下载 APK 和 apktool
+        if: steps.seen.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p work tools
+          gh release download "${{ steps.up.outputs.tag }}" -R "$UPSTREAM" -p "${{ steps.up.outputs.asset }}" -D work
+          mv "work/${{ steps.up.outputs.asset }}" work/orig.apk
+          gh release download -R iBotPeaches/Apktool -p 'apktool_*.jar' -D tools
+          mv tools/apktool_*.jar tools/apktool.jar
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)
+          echo "build-tools: $BT"
+          echo "BT=$BT" >> "$GITHUB_ENV"
+          ls -lh work tools
+
+      - name: 写入 manifest 补丁脚本
+        if: steps.seen.outputs.skip != 'true'
+        run: |
+          mkdir -p tools
+          cat > tools/patch_manifest.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """Patch a decoded (apktool) AndroidManifest.xml so the app can be embedded
+          inside another app's window via Android Activity Embedding.
+
+          Usage: patch_manifest.py <AndroidManifest.xml> <report.json>
+          """
+          import json
+          import sys
+          import xml.etree.ElementTree as ET
+
+          ANDROID = "http://schemas.android.com/apk/res/android"
+
+
+          def a(name):
+              return "{%s}%s" % (ANDROID, name)
+
+
+          def main(path, report_path):
+              # Keep every namespace prefix exactly as in the source file.
+              for _, (prefix, uri) in ET.iterparse(path, events=["start-ns"]):
+                  try:
+                      ET.register_namespace(prefix, uri)
+                  except ValueError:
+                      pass
+
+              tree = ET.parse(path)
+              root = tree.getroot()
+              package = root.get("package")
+              app = root.find("application")
+              if app is None or not package:
+                  sys.exit("ERROR: no <application> or no package in manifest")
+
+              def full(name):
+                  if name is None:
+                      return None
+                  if name.startswith("."):
+                      return package + name
+                  if "." not in name:
+                      return package + "." + name
+                  return name
+
+              # ---- find launcher component (activity or activity-alias) ----
+              def is_launcher(el):
+                  for f in el.findall("intent-filter"):
+                      acts = [x.get(a("name")) for x in f.findall("action")]
+                      cats = [x.get(a("name")) for x in f.findall("category")]
+                      if "android.intent.action.MAIN" in acts and "android.intent.category.LAUNCHER" in cats:
+                          return True
+                  return False
+
+              activities = app.findall("activity")
+              aliases = app.findall("activity-alias")
+              launcher_el = next((e for e in activities if is_launcher(e)), None)
+              launcher_alias = None
+              if launcher_el is None:
+                  launcher_alias = next((e for e in aliases if is_launcher(e)), None)
+                  if launcher_alias is not None:
+                      target = full(launcher_alias.get(a("targetActivity")))
+                      launcher_el = next((e for e in activities if full(e.get(a("name"))) == target), None)
+              if launcher_el is None:
+                  sys.exit("ERROR: could not find a launcher activity in the manifest")
+
+              report = {
+                  "package": package,
+                  "launcher_activity": full(launcher_el.get(a("name"))),
+                  "launcher_alias": full(launcher_alias.get(a("name"))) if launcher_alias is not None else None,
+                  "orig_launchMode": launcher_el.get(a("launchMode")),
+                  "orig_launcher_screenOrientation": launcher_el.get(a("screenOrientation")),
+                  "orig_app_resizeableActivity": app.get(a("resizeableActivity")),
+                  "activities_total": len(activities),
+                  "orientation_locks_removed": [],
+              }
+
+              # ---- app-level switches ----
+              app.set(a("allowUntrustedActivityEmbedding"), "true")
+              app.set(a("resizeableActivity"), "true")
+
+              # ---- per-activity switches ----
+              for act in activities:
+                  act.set(a("allowUntrustedActivityEmbedding"), "true")
+                  if a("resizeableActivity") in act.attrib:
+                      act.set(a("resizeableActivity"), "true")
+                  ori = act.get(a("screenOrientation"))
+                  if ori and "portrait" in ori.lower():
+                      report["orientation_locks_removed"].append(
+                          {"activity": full(act.get(a("name"))), "was": ori})
+                      del act.attrib[a("screenOrientation")]
+
+              # ---- launch mode: singleTask/singleInstance cannot live in the host's task ----
+              lm = launcher_el.get(a("launchMode"))
+              if lm in ("singleTask", "singleInstance", "singleInstancePerTask"):
+                  del launcher_el.attrib[a("launchMode")]
+                  report["launchMode_removed"] = lm
+
+              tree.write(path, encoding="utf-8", xml_declaration=True)
+              with open(report_path, "w", encoding="utf-8") as fh:
+                  json.dump(report, fh, indent=2, ensure_ascii=False)
+              print(json.dumps(report, indent=2, ensure_ascii=False))
+
+
+          if __name__ == "__main__":
+              if len(sys.argv) != 3:
+                  sys.exit(__doc__)
+              main(sys.argv[1], sys.argv[2])
+          PYEOF
+
+      - name: 解包、改 manifest、重打包
+        if: steps.seen.outputs.skip != 'true'
+        run: |
+          set -uo pipefail
+          # 先用最保守的方式（不拆 smali、不重编资源），失败再退回只不拆 smali
+          ok=0
+          for mode in "-r -s" "-s"; do
+            echo "=== apktool 模式: $mode ==="
+            rm -rf work/dec work/unsigned.apk
+            if java -jar tools/apktool.jar d $mode -f -o work/dec work/orig.apk \
+               && python3 -I tools/patch_manifest.py work/dec/AndroidManifest.xml work/report.json \
+               && java -jar tools/apktool.jar b -o work/unsigned.apk work/dec; then
+              echo "MODE=$mode" >> "$GITHUB_ENV"
+              ok=1
+              break
+            fi
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::error::apktool 两种模式都失败了，把上面的日志发给我"
+            exit 1
+          fi
+
+      - name: 对齐并签名
+        if: steps.seen.outputs.skip != 'true'
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          "$BT/zipalign" -p -f 4 work/unsigned.apk work/aligned.apk
+          if [ -n "${KS_B64:-}" ]; then
+            echo "使用你自己的签名密钥（仓库 Secrets）"
+            echo "$KS_B64" | base64 -d > work/my.keystore
+            "$BT/apksigner" sign --ks work/my.keystore --ks-pass env:KS_PASS \
+              --ks-key-alias "$KS_ALIAS" --key-pass env:KEY_PASS \
+              --out work/final.apk work/aligned.apk
+            echo "SIGNED_WITH=own" >> "$GITHUB_ENV"
+          else
+            echo "没有设置 Secrets：使用上游公开的 ks-p12.keystore（和你现在装的版本签名相同，可直接覆盖安装、保留登录）"
+            curl -fsSL -o work/up.keystore "https://raw.githubusercontent.com/${UPSTREAM}/main/ks-p12.keystore"
+            export UP_PASS=123456789
+            "$BT/apksigner" sign --ks work/up.keystore --ks-pass env:UP_PASS \
+              --ks-key-alias jhc --key-pass env:UP_PASS \
+              --out work/final.apk work/aligned.apk
+            echo "SIGNED_WITH=upstream" >> "$GITHUB_ENV"
+          fi
+
+      - name: 校验结果
+        if: steps.seen.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          "$BT/apksigner" verify --print-certs work/orig.apk  | grep -i 'SHA-256' | head -n1 | tee work/orig_cert.txt
+          "$BT/apksigner" verify --print-certs work/final.apk | grep -i 'SHA-256' | head -n1 | tee work/final_cert.txt
+          if cmp -s work/orig_cert.txt work/final_cert.txt; then SAME_SIG=yes; else SAME_SIG=no; fi
+          echo "签名与上游相同: $SAME_SIG"
+          # manifest 里必须真的带上了这个属性
+          "$BT/aapt2" dump xmltree --file AndroidManifest.xml work/final.apk > work/tree.txt
+          grep -c 'allowUntrustedActivityEmbedding' work/tree.txt
+          grep -q 'allowUntrustedActivityEmbedding' work/tree.txt
+          "$BT/aapt2" dump badging work/final.apk | grep -E "^package:|^sdkVersion|^targetSdkVersion|launchable-activity" | tee work/badging.txt
+          cp work/final.apk YTMusic-Embed.apk
+          {
+            echo "## 结果"
+            echo '```json'; cat work/report.json; echo '```'
+            echo "- 上游: ${{ steps.up.outputs.tag }} / ${{ steps.up.outputs.asset }}"
+            echo "- apktool 模式: $MODE"
+            echo "- 签名: $SIGNED_WITH，与上游签名相同: $SAME_SIG"
+            echo '```'; cat work/badging.txt; echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY" > work/notes.md
+          echo "SAME_SIG=$SAME_SIG" >> "$GITHUB_ENV"
+
+      - name: 发布到 Releases
+        if: steps.seen.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          cp work/report.json embed-info.json
+          if gh release view "${{ steps.seen.outputs.out_tag }}" >/dev/null 2>&1; then
+            gh release delete "${{ steps.seen.outputs.out_tag }}" --yes --cleanup-tag
+          fi
+          gh release create "${{ steps.seen.outputs.out_tag }}" YTMusic-Embed.apk embed-info.json \
+            --title "YT Music（可嵌入）基于上游 ${{ steps.up.outputs.tag }}" \
+            --notes-file work/notes.md

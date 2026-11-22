@@ -106,6 +106,9 @@ jobs:
 
 
           def main(path, report_path):
+              with open(path, "rb") as fh:
+                  if fh.read(2) == b"\x03\x00":
+                      sys.exit("ERROR: AndroidManifest.xml is still binary (apktool did not decode it)")
               # Keep every namespace prefix exactly as in the source file.
               for _, (prefix, uri) in ET.iterparse(path, events=["start-ns"]):
                   try:
@@ -198,21 +201,28 @@ jobs:
         if: steps.seen.outputs.skip != 'true'
         run: |
           set -uo pipefail
-          # 先用最保守的方式（不拆 smali、不重编资源），失败再退回只不拆 smali
+          # 先试最保守的方式（不拆 smali、不重编资源、强制解码 manifest），失败再退回只不拆 smali
           ok=0
-          for mode in "-r -s" "-s"; do
-            echo "=== apktool 模式: $mode ==="
+          n=0
+          for mode in "-r -s --force-manifest" "-s"; do
+            n=$((n+1))
+            echo "=== 模式 $n: $mode ==="
             rm -rf work/dec work/unsigned.apk
-            if java -jar tools/apktool.jar d $mode -f -o work/dec work/orig.apk \
-               && python3 -I tools/patch_manifest.py work/dec/AndroidManifest.xml work/report.json \
-               && java -jar tools/apktool.jar b -o work/unsigned.apk work/dec; then
+            {
+              java -jar tools/apktool.jar d $mode -f -o work/dec work/orig.apk &&
+              python3 -I tools/patch_manifest.py work/dec/AndroidManifest.xml work/report.json &&
+              java -jar tools/apktool.jar b -o work/unsigned.apk work/dec
+            } > "work/mode$n.log" 2>&1
+            if [ $? -eq 0 ] && [ -f work/unsigned.apk ]; then
               echo "MODE=$mode" >> "$GITHUB_ENV"
               ok=1
               break
             fi
+            echo "--- 模式 $n 失败，错误摘要 ---"
+            grep -E "Error|error|ERROR|Traceback|W: " "work/mode$n.log" | tail -n 8
           done
           if [ "$ok" != 1 ]; then
-            echo "::error::apktool 两种模式都失败了，把上面的日志发给我"
+            echo "::error::apktool 两种模式都失败了，把上面「错误摘要」截图发给我"
             exit 1
           fi
 

@@ -69,162 +69,389 @@ jobs:
           fi
           echo "out_tag=$OUT_TAG" >> "$GITHUB_OUTPUT"
 
-      - name: 下载 APK 和 apktool
+      - name: 下载 APK
         if: steps.seen.outputs.skip != 'true'
         run: |
           set -euo pipefail
           mkdir -p work tools
           gh release download "${{ steps.up.outputs.tag }}" -R "$UPSTREAM" -p "${{ steps.up.outputs.asset }}" -D work
           mv "work/${{ steps.up.outputs.asset }}" work/orig.apk
-          gh release download -R iBotPeaches/Apktool -p 'apktool_*.jar' -D tools
-          mv tools/apktool_*.jar tools/apktool.jar
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)
           echo "build-tools: $BT"
           echo "BT=$BT" >> "$GITHUB_ENV"
           ls -lh work tools
 
-      - name: 写入 manifest 补丁脚本
+      - name: 写入补丁脚本
         if: steps.seen.outputs.skip != 'true'
         run: |
           mkdir -p tools
-          cat > tools/patch_manifest.py <<'PYEOF'
+          cat > tools/patch_apk.py <<'PYEOF'
           #!/usr/bin/env python3
-          """Patch a decoded (apktool) AndroidManifest.xml so the app can be embedded
-          inside another app's window via Android Activity Embedding.
+          """Make an APK embeddable (Android Activity Embedding) WITHOUT apktool:
+          only the binary AndroidManifest.xml is edited and written back; every other
+          file in the APK is copied byte for byte (same compression method).
 
-          Usage: patch_manifest.py <AndroidManifest.xml> <report.json>
+          Usage: patch_apk.py <in.apk> <out.apk> <report.json> <android.jar | attr=id,attr=id>
+          The last argument is either an Android SDK android.jar (>= API 32, used to look
+          up the attribute resource ids with javap) or explicit "name=id,name=id" pairs.
           """
           import json
+          import re
+          import struct
+          import subprocess
           import sys
-          import xml.etree.ElementTree as ET
+          import zipfile
 
-          ANDROID = "http://schemas.android.com/apk/res/android"
+          ANDROID_NS = "http://schemas.android.com/apk/res/android"
+          NONE = 0xFFFFFFFF
+          T_STRING, T_INT_DEC, T_BOOL = 0x03, 0x10, 0x12
+          WANT = ["allowUntrustedActivityEmbedding", "resizeableActivity"]
+          PORTRAIT = {1: "portrait", 7: "sensorPortrait", 9: "reversePortrait", 12: "userPortrait"}
+          LAUNCH = {0: "standard", 1: "singleTop", 2: "singleTask", 3: "singleInstance", 4: "singleInstancePerTask"}
 
 
-          def a(name):
-              return "{%s}%s" % (ANDROID, name)
+          # ----------------------------------------------------------------- string pool
+          class Pool:
+              def __init__(self, data, off):
+                  (typ, hs, size, count, scount, flags, sstart, _ss) = struct.unpack_from("<HHIIIIII", data, off)
+                  if typ != 0x0001:
+                      raise ValueError("string pool expected")
+                  if scount:
+                      raise ValueError("string pool with styles is not supported")
+                  self.utf8 = bool(flags & 0x100)
+                  self.flags = flags & ~0x1  # never claim "sorted"
+                  offs = struct.unpack_from("<%dI" % count, data, off + hs)
+                  base = off + sstart
+                  self.raw, self.text = [], []
+                  for o in offs:
+                      p = base + o
+                      if self.utf8:
+                          n, p2 = self._len8(data, p)
+                          bl, p2 = self._len8(data, p2)
+                          txt = data[p2:p2 + bl].decode("utf-8", "replace")
+                          end = p2 + bl + 1
+                      else:
+                          n = struct.unpack_from("<H", data, p)[0]
+                          p2 = p + 2
+                          if n & 0x8000:
+                              n = ((n & 0x7FFF) << 16) | struct.unpack_from("<H", data, p2)[0]
+                              p2 += 2
+                          txt = data[p2:p2 + 2 * n].decode("utf-16le", "replace")
+                          end = p2 + 2 * n + 2
+                      self.raw.append(bytes(data[p:end]))
+                      self.text.append(txt)
+                  self.size = size
+
+              @staticmethod
+              def _len8(data, p):
+                  n = data[p]
+                  p += 1
+                  if n & 0x80:
+                      n = ((n & 0x7F) << 8) | data[p]
+                      p += 1
+                  return n, p
+
+              def encode(self, s):
+                  if self.utf8:
+                      b = s.encode("utf-8")
+                      if len(s) > 127 or len(b) > 127:
+                          raise ValueError("new string too long")
+                      return bytes([len(s), len(b)]) + b + b"\0"
+                  return struct.pack("<H", len(s)) + s.encode("utf-16le") + b"\0\0"
+
+              def serialize(self):
+                  blob = b"".join(self.raw)
+                  offs, cur = [], 0
+                  for r in self.raw:
+                      offs.append(cur)
+                      cur += len(r)
+                  blob += b"\0" * ((4 - len(blob) % 4) % 4)
+                  n = len(self.raw)
+                  sstart = 28 + 4 * n
+                  head = struct.pack("<HHIIIIII", 0x0001, 28, sstart + len(blob), n, 0, self.flags, sstart, 0)
+                  return head + struct.pack("<%dI" % n, *offs) + blob
 
 
-          def main(path, report_path):
-              with open(path, "rb") as fh:
-                  if fh.read(2) == b"\x03\x00":
-                      sys.exit("ERROR: AndroidManifest.xml is still binary (apktool did not decode it)")
-              # Keep every namespace prefix exactly as in the source file.
-              for _, (prefix, uri) in ET.iterparse(path, events=["start-ns"]):
-                  try:
-                      ET.register_namespace(prefix, uri)
-                  except ValueError:
-                      pass
+          # ----------------------------------------------------------------- xml tree
+          class El:
+              def __init__(self, line, comment, ns, name, attrs, extra):
+                  self.line, self.comment, self.ns, self.name = line, comment, ns, name
+                  self.attrs = attrs      # list of dict(ns,name,raw,dtype,data)
+                  self.extra = extra      # (idIdx, classIdx, styleIdx)
+                  self.children = []
 
-              tree = ET.parse(path)
-              root = tree.getroot()
-              package = root.get("package")
-              app = root.find("application")
-              if app is None or not package:
-                  sys.exit("ERROR: no <application> or no package in manifest")
 
-              def full(name):
-                  if name is None:
+          def parse(data):
+              typ, hs, size = struct.unpack_from("<HHI", data, 0)
+              if typ != 0x0003:
+                  raise ValueError("not a binary XML file")
+              pool = Pool(data, hs)
+              off = hs + pool.size
+              typ, chs, csize = struct.unpack_from("<HHI", data, off)
+              if typ != 0x0180:
+                  raise ValueError("resource map chunk expected after string pool")
+              ids = list(struct.unpack_from("<%dI" % ((csize - chs) // 4), data, off + chs))
+              off += csize
+              nodes, stack, root = [], [], None
+              while off < len(data):
+                  typ, chs, csize = struct.unpack_from("<HHI", data, off)
+                  line, comment = struct.unpack_from("<II", data, off + 8)
+                  body = off + 16
+                  if typ == 0x0102:
+                      ns, name, astart, asize, cnt, i1, i2, i3 = struct.unpack_from("<IIHHHHHH", data, body)
+                      attrs = []
+                      for k in range(cnt):
+                          a = struct.unpack_from("<IIIHBBI", data, body + astart + k * asize)
+                          attrs.append(dict(ns=a[0], name=a[1], raw=a[2], dtype=a[5], data=a[6]))
+                      el = El(line, comment, ns, name, attrs, (i1, i2, i3))
+                      if stack:
+                          stack[-1].children.append(el)
+                      else:
+                          root = el
+                      stack.append(el)
+                      nodes.append(("el", el))
+                  elif typ == 0x0103:
+                      ns, name = struct.unpack_from("<II", data, body)
+                      stack.pop()
+                      nodes.append(("end", line, comment, ns, name))
+                  elif typ in (0x0100, 0x0101):
+                      a, b = struct.unpack_from("<II", data, body)
+                      nodes.append(("nsx", typ, line, comment, a, b))
+                  elif typ == 0x0104:
+                      d, sz, r0, dt, dd = struct.unpack_from("<IHBBI", data, body)
+                      nodes.append(("cdata", line, comment, d, dt, dd))
+                  else:
+                      raise ValueError("unknown XML chunk 0x%x" % typ)
+                  off += csize
+              return pool, ids, nodes, root
+
+
+          def serialize(nodes):
+              out = []
+              for n in nodes:
+                  k = n[0]
+                  if k == "el":
+                      e = n[1]
+                      if any(e.extra):
+                          raise ValueError("elements with id/class/style attribute indexes are not supported")
+                      body = struct.pack("<IIHHHHHH", e.ns, e.name, 20, 20, len(e.attrs), 0, 0, 0)
+                      for a in e.attrs:
+                          body += struct.pack("<IIIHBBI", a["ns"], a["name"], a["raw"], 8, 0, a["dtype"], a["data"])
+                      out.append(struct.pack("<HHIII", 0x0102, 16, 16 + len(body), e.line, e.comment) + body)
+                  elif k == "end":
+                      _, line, comment, ns, name = n
+                      out.append(struct.pack("<HHIIIII", 0x0103, 16, 24, line, comment, ns, name))
+                  elif k == "nsx":
+                      _, typ, line, comment, x, y = n
+                      out.append(struct.pack("<HHIIIII", typ, 16, 24, line, comment, x, y))
+                  else:
+                      _, line, comment, d, dt, dd = n
+                      out.append(struct.pack("<HHIIIIHBBI", 0x0104, 16, 28, line, comment, d, 8, 0, dt, dd))
+              return b"".join(out)
+
+
+          # ----------------------------------------------------------------- patching
+          def lookup_ids(arg):
+              ids = {}
+              if "=" in arg and not arg.endswith(".jar"):
+                  for part in arg.split(","):
+                      k, v = part.split("=")
+                      ids[k] = int(v)
+                  return ids
+              txt = subprocess.run(["javap", "-constants", "-cp", arg, "android.R$attr"],
+                                   check=True, capture_output=True, text=True).stdout
+              for name in WANT:
+                  m = re.search(r"\b%s = (-?\d+);" % name, txt)
+                  if not m:
+                      sys.exit("ERROR: %s not found in %s (need an SDK platform >= API 32)" % (name, arg))
+                  ids[name] = int(m.group(1)) & 0xFFFFFFFF
+              return ids
+
+
+          def patch_manifest(data, attr_ids):
+              pool, ids, nodes, root = parse(data)
+              R = len(ids)
+              # names we need: reuse the pool entry if it already carries the right resource id
+              new_names = [n for n in WANT
+                           if not any(pool.text[i] == n and ids[i] == attr_ids[n] for i in range(R))]
+              k = len(new_names)
+
+              def shift(i):
+                  return i if (i == NONE or i < R) else i + k
+
+              pool.raw = pool.raw[:R] + [pool.encode(n) for n in new_names] + pool.raw[R:]
+              pool.text = pool.text[:R] + new_names + pool.text[R:]
+              ids = ids + [attr_ids[n] for n in new_names]
+
+              # renumber every string reference once, up front; later edits use final indexes
+              shifted = []
+              for nd in nodes:
+                  t = nd[0]
+                  if t == "el":
+                      e = nd[1]
+                      e.ns, e.name, e.comment = shift(e.ns), shift(e.name), shift(e.comment)
+                      for a in e.attrs:
+                          a["ns"], a["name"], a["raw"] = shift(a["ns"]), shift(a["name"]), shift(a["raw"])
+                          if a["dtype"] == T_STRING:
+                              a["data"] = shift(a["data"])
+                      shifted.append(nd)
+                  elif t == "end":
+                      shifted.append(("end", nd[1], shift(nd[2]), shift(nd[3]), shift(nd[4])))
+                  elif t == "nsx":
+                      shifted.append(("nsx", nd[1], nd[2], shift(nd[3]), shift(nd[4]), shift(nd[5])))
+                  else:
+                      shifted.append(("cdata", nd[1], shift(nd[2]), shift(nd[3]), nd[4],
+                                      shift(nd[5]) if nd[4] == T_STRING else nd[5]))
+              nodes = shifted
+
+              def txt(i):
+                  return pool.text[i] if i != NONE and i < len(pool.text) else None
+
+              def name_idx(n):
+                  for i in range(len(ids)):
+                      if pool.text[i] == n and ids[i] == attr_ids[n]:
+                          return i
+                  raise ValueError("attribute name not in pool: " + n)
+
+              ns_idx = next((i for i, t in enumerate(pool.text) if t == ANDROID_NS), None)
+              if ns_idx is None:
+                  sys.exit("ERROR: manifest has no android namespace string")
+
+              def find(el, name):
+                  for a in el.attrs:
+                      if txt(a["name"]) == name and txt(a["ns"]) == ANDROID_NS:
+                          return a
+                  return None
+
+              def sval(el, name):
+                  a = find(el, name)
+                  return txt(a["raw"]) if a is not None and a["dtype"] == T_STRING else None
+
+              def set_bool(el, name):
+                  a = find(el, name)
+                  if a is not None:
+                      a["raw"], a["dtype"], a["data"] = NONE, T_BOOL, NONE
+                      return
+                  ni = name_idx(name)
+                  rid = ids[ni]
+                  new = dict(ns=ns_idx, name=ni, raw=NONE, dtype=T_BOOL, data=NONE)
+                  pos = len(el.attrs)
+                  for j, o in enumerate(el.attrs):
+                      oi = o["name"]
+                      if oi < len(ids) and ids[oi] > rid:
+                          pos = j
+                          break
+                  el.attrs.insert(pos, new)
+
+              def remove(el, name):
+                  el.attrs[:] = [a for a in el.attrs if not (txt(a["name"]) == name and txt(a["ns"]) == ANDROID_NS)]
+
+              pkg = None
+              for a in root.attrs:
+                  if txt(a["name"]) == "package":
+                      pkg = txt(a["raw"])
+              app = next((c for c in root.children if txt(c.name) == "application"), None)
+              if not pkg or app is None:
+                  sys.exit("ERROR: no package or no <application> in manifest")
+
+              def full(n):
+                  if n is None:
                       return None
-                  if name.startswith("."):
-                      return package + name
-                  if "." not in name:
-                      return package + "." + name
-                  return name
+                  if n.startswith("."):
+                      return pkg + n
+                  return n if "." in n else pkg + "." + n
 
-              # ---- find launcher component (activity or activity-alias) ----
               def is_launcher(el):
-                  for f in el.findall("intent-filter"):
-                      acts = [x.get(a("name")) for x in f.findall("action")]
-                      cats = [x.get(a("name")) for x in f.findall("category")]
+                  for f in (c for c in el.children if txt(c.name) == "intent-filter"):
+                      acts = [sval(c, "name") for c in f.children if txt(c.name) == "action"]
+                      cats = [sval(c, "name") for c in f.children if txt(c.name) == "category"]
                       if "android.intent.action.MAIN" in acts and "android.intent.category.LAUNCHER" in cats:
                           return True
                   return False
 
-              activities = app.findall("activity")
-              aliases = app.findall("activity-alias")
-              launcher_el = next((e for e in activities if is_launcher(e)), None)
-              launcher_alias = None
-              if launcher_el is None:
-                  launcher_alias = next((e for e in aliases if is_launcher(e)), None)
-                  if launcher_alias is not None:
-                      target = full(launcher_alias.get(a("targetActivity")))
-                      launcher_el = next((e for e in activities if full(e.get(a("name"))) == target), None)
-              if launcher_el is None:
-                  sys.exit("ERROR: could not find a launcher activity in the manifest")
+              acts = [c for c in app.children if txt(c.name) == "activity"]
+              aliases = [c for c in app.children if txt(c.name) == "activity-alias"]
+              launcher = next((e for e in acts if is_launcher(e)), None)
+              alias = None
+              if launcher is None:
+                  alias = next((e for e in aliases if is_launcher(e)), None)
+                  if alias is not None:
+                      tgt = full(sval(alias, "targetActivity"))
+                      launcher = next((e for e in acts if full(sval(e, "name")) == tgt), None)
+              if launcher is None:
+                  sys.exit("ERROR: no launcher activity found")
+
+              def enum_of(el, name, table):
+                  a = find(el, name)
+                  return None if a is None else table.get(a["data"], str(a["data"]))
 
               report = {
-                  "package": package,
-                  "launcher_activity": full(launcher_el.get(a("name"))),
-                  "launcher_alias": full(launcher_alias.get(a("name"))) if launcher_alias is not None else None,
-                  "orig_launchMode": launcher_el.get(a("launchMode")),
-                  "orig_launcher_screenOrientation": launcher_el.get(a("screenOrientation")),
-                  "orig_app_resizeableActivity": app.get(a("resizeableActivity")),
-                  "activities_total": len(activities),
+                  "package": pkg,
+                  "launcher_activity": full(sval(launcher, "name")),
+                  "launcher_alias": full(sval(alias, "name")) if alias is not None else None,
+                  "orig_launchMode": enum_of(launcher, "launchMode", LAUNCH),
+                  "orig_launcher_screenOrientation": enum_of(launcher, "screenOrientation", PORTRAIT),
+                  "activities_total": len(acts),
                   "orientation_locks_removed": [],
               }
 
-              # ---- app-level switches ----
-              app.set(a("allowUntrustedActivityEmbedding"), "true")
-              app.set(a("resizeableActivity"), "true")
-
-              # ---- per-activity switches ----
-              for act in activities:
-                  act.set(a("allowUntrustedActivityEmbedding"), "true")
-                  if a("resizeableActivity") in act.attrib:
-                      act.set(a("resizeableActivity"), "true")
-                  ori = act.get(a("screenOrientation"))
-                  if ori and "portrait" in ori.lower():
+              set_bool(app, "allowUntrustedActivityEmbedding")
+              set_bool(app, "resizeableActivity")
+              for e in acts:
+                  set_bool(e, "allowUntrustedActivityEmbedding")
+                  if find(e, "resizeableActivity") is not None:
+                      set_bool(e, "resizeableActivity")
+                  so = find(e, "screenOrientation")
+                  if so is not None and so["data"] in PORTRAIT:
                       report["orientation_locks_removed"].append(
-                          {"activity": full(act.get(a("name"))), "was": ori})
-                      del act.attrib[a("screenOrientation")]
+                          {"activity": full(sval(e, "name")), "was": PORTRAIT[so["data"]]})
+                      remove(e, "screenOrientation")
+              lm = find(launcher, "launchMode")
+              if lm is not None and lm["data"] in (2, 3, 4):
+                  report["launchMode_removed"] = LAUNCH[lm["data"]]
+                  remove(launcher, "launchMode")
 
-              # ---- launch mode: singleTask/singleInstance cannot live in the host's task ----
-              lm = launcher_el.get(a("launchMode"))
-              if lm in ("singleTask", "singleInstance", "singleInstancePerTask"):
-                  del launcher_el.attrib[a("launchMode")]
-                  report["launchMode_removed"] = lm
+              body = pool.serialize()
+              resmap = struct.pack("<HHI", 0x0180, 8, 8 + 4 * len(ids)) + struct.pack("<%dI" % len(ids), *ids)
+              rest = serialize(nodes)
+              total = 8 + len(body) + len(resmap) + len(rest)
+              return struct.pack("<HHI", 0x0003, 8, total) + body + resmap + rest, report
 
-              tree.write(path, encoding="utf-8", xml_declaration=True)
+
+          def main(src, dst, report_path, idarg):
+              attr_ids = lookup_ids(idarg)
+              with zipfile.ZipFile(src) as zin:
+                  manifest = zin.read("AndroidManifest.xml")
+                  new_manifest, report = patch_manifest(manifest, attr_ids)
+                  with zipfile.ZipFile(dst, "w") as zout:
+                      for zi in zin.infolist():
+                          name = zi.filename
+                          if re.match(r"META-INF/[^/]+\.(SF|RSA|DSA|EC)$", name, re.I) or name == "META-INF/MANIFEST.MF":
+                              continue  # old signature, will be re-signed
+                          data = new_manifest if name == "AndroidManifest.xml" else zin.read(name)
+                          ni = zipfile.ZipInfo(name, zi.date_time)
+                          ni.compress_type = zi.compress_type
+                          ni.external_attr = zi.external_attr
+                          zout.writestr(ni, data)
               with open(report_path, "w", encoding="utf-8") as fh:
                   json.dump(report, fh, indent=2, ensure_ascii=False)
               print(json.dumps(report, indent=2, ensure_ascii=False))
 
 
           if __name__ == "__main__":
-              if len(sys.argv) != 3:
+              if len(sys.argv) != 5:
                   sys.exit(__doc__)
-              main(sys.argv[1], sys.argv[2])
+              main(*sys.argv[1:])
           PYEOF
 
-      - name: 解包、改 manifest、重打包
+      - name: 直接修改 APK 里的 manifest（不用 apktool）
         if: steps.seen.outputs.skip != 'true'
         run: |
-          set -uo pipefail
-          # 先试最保守的方式（不拆 smali、不重编资源、强制解码 manifest），失败再退回只不拆 smali
-          ok=0
-          n=0
-          for mode in "-r -s --force-manifest" "-s"; do
-            n=$((n+1))
-            echo "=== 模式 $n: $mode ==="
-            rm -rf work/dec work/unsigned.apk
-            {
-              java -jar tools/apktool.jar d $mode -f -o work/dec work/orig.apk &&
-              python3 -I tools/patch_manifest.py work/dec/AndroidManifest.xml work/report.json &&
-              java -jar tools/apktool.jar b -o work/unsigned.apk work/dec
-            } > "work/mode$n.log" 2>&1
-            if [ $? -eq 0 ] && [ -f work/unsigned.apk ]; then
-              echo "MODE=$mode" >> "$GITHUB_ENV"
-              ok=1
-              break
-            fi
-            echo "--- 模式 $n 失败，错误摘要 ---"
-            grep -E "Error|error|ERROR|Traceback|W: " "work/mode$n.log" | tail -n 8
-          done
-          if [ "$ok" != 1 ]; then
-            echo "::error::apktool 两种模式都失败了，把上面「错误摘要」截图发给我"
-            exit 1
-          fi
+          set -euo pipefail
+          # 用 SDK 的 android.jar 查出 allowUntrustedActivityEmbedding 的资源 id
+          JAR="$(ls -d "$ANDROID_HOME"/platforms/android-[0-9]* | sort -V | tail -n1)/android.jar"
+          echo "android.jar: $JAR"
+          python3 -I tools/patch_apk.py work/orig.apk work/unsigned.apk work/report.json "$JAR"
 
       - name: 对齐并签名
         if: steps.seen.outputs.skip != 'true'
@@ -271,7 +498,6 @@ jobs:
             echo "## 结果"
             echo '```json'; cat work/report.json; echo '```'
             echo "- 上游: ${{ steps.up.outputs.tag }} / ${{ steps.up.outputs.asset }}"
-            echo "- apktool 模式: $MODE"
             echo "- 签名: $SIGNED_WITH，与上游签名相同: $SAME_SIG"
             echo '```'; cat work/badging.txt; echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY" > work/notes.md
